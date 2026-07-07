@@ -16,11 +16,15 @@ MIN_BLOCK_LEN = 10_000
 
 
 class RustyMinMaxScaler(_SKMinMaxScaler):
-    """Drop-in MinMaxScaler that prefers the Rust fastpath where supported."""
+    """Drop-in MinMaxScaler that prefers the Rust fastpath where supported.
+
+    Supported params: feature_range=(0, 1). copy and clip are always honored
+    (clip is passed straight through to the Rust kernel)."""
 
     def __init__(self, feature_range=(0, 1), copy=True, n_jobs=None, clip=False):
         super().__init__(feature_range=feature_range, copy=copy, clip=clip)
-        self._supported_params = copy and clip
+        lo, hi = self.feature_range
+        self._supported_params = (lo == 0 and hi == 1)
 
         cores = os.cpu_count()
 
@@ -48,7 +52,7 @@ class RustyMinMaxScaler(_SKMinMaxScaler):
             and rc.get("rust_backend", False)
             and rb.HAVE_RUST
             and getattr(rb, "minmax_scale_fit", None)
-            and not self._supported_params
+            and self._supported_params
         ):
             logger.debug("Rust disabled, fallback to scikit for fit")
             return super().fit(X, y)
@@ -68,8 +72,8 @@ class RustyMinMaxScaler(_SKMinMaxScaler):
             rc.get("allow_patch", False)
             and rc.get("rust_backend", False)
             and rb.HAVE_RUST
-            and getattr(rb, "minmax_scale_fit", None)
-            and not self._supported_params
+            and getattr(rb, "minmax_scale_transform", None)
+            and self._supported_params
         ):
             logger.debug("Rust disabled, fallback to scikit for fit")
             return super().transform(X)
@@ -88,7 +92,7 @@ class RustyMinMaxScaler(_SKMinMaxScaler):
         except Exception as e:
             logger.warning(f"Rust minmax_scale_transform failed, falling back: {e}")
             return super().transform(X)
-        rb.print_timing("standard_scale_transform", t0)
+        rb.print_timing("minmax_scale_transform", t0)
 
         return out
 
