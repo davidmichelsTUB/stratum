@@ -1,4 +1,5 @@
 use crate::threads::get_thread_pool;
+use crate::util::{print_timing, start_timing};
 use ndarray::Axis;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -35,6 +36,7 @@ pub fn compute_minmax_scale_transform(
     } else {
         (f32::NEG_INFINITY, f32::INFINITY)
     };
+    let t0 = start_timing();
     let mut compute = || {
         out.axis_chunks_iter_mut(Axis(0), chunk_size)
             .into_par_iter()
@@ -67,6 +69,7 @@ pub fn compute_minmax_scale_transform(
         Some(p) => p.install(&mut compute),
         None => compute(),
     }
+    print_timing("minmax scale transform", t0);
 
     unsafe { out.assume_init() }
 }
@@ -86,6 +89,7 @@ pub fn compute_minmax_scale_fit(
         );
     }
 
+    let t0 = start_timing();
     let mut compute = || {
         x.axis_chunks_iter(Axis(0), chunk_size)
             .into_par_iter()
@@ -122,6 +126,7 @@ pub fn compute_minmax_scale_fit(
         Some(p) => p.install(&mut compute),
         None => compute(),
     };
+    print_timing("minmax scale fit", t0);
 
     (ndarray::Array1::from(min), ndarray::Array1::from(max))
 }
