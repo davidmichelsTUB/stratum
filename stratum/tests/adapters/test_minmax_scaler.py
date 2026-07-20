@@ -42,8 +42,7 @@ def test_minmax_parity_default_params(shape, capfd):
 
 @pytest.mark.skipif(not rb.HAVE_RUST, reason="Rust backend not built")
 def test_minmax_parity_clip_true(capfd):
-    """clip=True must still use the Rust fastpath (regression test: previously
-    the inverted _supported_params gate silently fell back to sklearn here)."""
+    """clip=True must still use the Rust fastpath."""
     x_fit = _make_data((100, 3))
 
     sk = SkMinMaxScaler(clip=True).fit(x_fit)
