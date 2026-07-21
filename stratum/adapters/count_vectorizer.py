@@ -19,7 +19,6 @@ class RustyCountVectorizer(_SKCountVectorizer):
 
     def __init__(self, n_jobs=None, **kwargs):
         super().__init__(**kwargs)
-
         cores = os.cpu_count()
         if n_jobs is None:
             self.n_jobs = cores
@@ -51,7 +50,7 @@ class RustyCountVectorizer(_SKCountVectorizer):
 
     def fit(self, raw_documents, y=None):
         if not self._rust_ready("count_vectorize_fit"):
-            logger.debug("Rust disabled, fallback to scikit for fit")
+            logger.warning("Rust disabled, fallback to scikit for fit")
             return super().fit(raw_documents, y)
 
         corpus = list(raw_documents)

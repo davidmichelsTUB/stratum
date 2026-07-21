@@ -15,6 +15,15 @@ from stratum._config import get_config
 from stratum.adapters.count_vectorizer import MIN_BLOCK_LEN, RustyCountVectorizer
 
 requires_rust = pytest.mark.skipif(not rb.HAVE_RUST, reason="Rust backend not built")
+REAL_SENTENCES = [
+    "The quick brown fox jumps over the lazy dog",
+    "A journey of a thousand miles begins with a single step",
+    "To be or not to be that is the question",
+    "All that glitters is not gold",
+    "The rain in Spain falls mainly on the plain",
+]
+
+random.seed(67)
 
 
 def get_synthetic_data(n_unique_words, max_length, n_sentences, max_sentence_len):
@@ -42,19 +51,10 @@ def capture_std_out(capfd):
     return combined_output
 
 
-REAL_SENTENCES = [
-    "The quick brown fox jumps over the lazy dog",
-    "A journey of a thousand miles begins with a single step",
-    "To be or not to be that is the question",
-    "All that glitters is not gold",
-    "The rain in Spain falls mainly on the plain",
-]
-
-
 @requires_rust
 @pytest.mark.parametrize("n_sentences", [10, 500, 5000, 25_000])
 def test_fit_transform_matches_sklearn_various_sizes(n_sentences, capfd):
-    random.seed(67)
+
     corpus = get_synthetic_data(
         n_unique_words=42, max_length=8, n_sentences=n_sentences, max_sentence_len=8
     )
@@ -76,7 +76,9 @@ def test_fit_transform_matches_sklearn_various_sizes(n_sentences, capfd):
 @requires_rust
 def test_fit_only_matches_sklearn_vocabulary():
     set_config(rust_backend=True, allow_patch=True, debug_timing=False)
-    corpus = ["red green blue", "green blue yellow", "blue yellow red"]
+    corpus = get_synthetic_data(
+        n_unique_words=42, max_length=8, n_sentences=5, max_sentence_len=8
+    )
 
     rv = RustyCountVectorizer()
     rv.fit(corpus)
@@ -89,8 +91,15 @@ def test_fit_only_matches_sklearn_vocabulary():
 @requires_rust
 def test_transform_after_fit_with_unseen_tokens(capfd):
     set_config(rust_backend=True, allow_patch=True, debug_timing=True)
-    train = ["alpha beta gamma", "beta delta epsilon"]
-    test_docs = ["alpha zzzunseen beta", "totally unseen document", ""]
+    train = get_synthetic_data(
+        n_unique_words=42, max_length=8, n_sentences=5, max_sentence_len=8
+    )
+    # different seed and differrent config will produce unknown words
+    random.seed(123)
+    test_docs = get_synthetic_data(
+        n_unique_words=100, max_length=100, n_sentences=2, max_sentence_len=8
+    )
+    random.seed(67)
 
     rv = RustyCountVectorizer()
     rv.fit(train)
@@ -115,8 +124,8 @@ def test_transform_after_fit_with_unseen_tokens(capfd):
     [None, "english", ["the", "is"], ["a", "of", "to"]],
     ids=["none", "english", "custom_list_1", "custom_list_2"],
 )
-def test_fit_transform_matches_sklearn_stopwords(stop_words):
-    set_config(rust_backend=True, allow_patch=True, debug_timing=False)
+def test_fit_transform_matches_sklearn_stopwords(stop_words, capfd):
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
 
     rv = RustyCountVectorizer(stop_words=stop_words)
     Z = rv.fit_transform(REAL_SENTENCES)
@@ -126,6 +135,8 @@ def test_fit_transform_matches_sklearn_stopwords(stop_words):
 
     assert rv.vocabulary_ == sk.vocabulary_
     np.testing.assert_array_equal(Z.toarray(), Z_ref.toarray())
+    print(capture_std_out(capfd))
+    assert "[rust]" in capture_std_out(capfd)
 
 
 def test_stopwords_set_custom_list():
