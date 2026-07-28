@@ -1,9 +1,9 @@
+use crate::tokenize;
 use crate::util::{print_timing, start_timing};
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 fn sort_vocab_lexi_inplace(vocabulary: &mut FxHashMap<String, usize>, j_indices: &mut Vec<usize>) {
@@ -24,6 +24,7 @@ fn sort_vocab_lexi_inplace(vocabulary: &mut FxHashMap<String, usize>, j_indices:
     }
 }
 
+
 struct Partial {
     vocab: FxHashMap<String, usize>,
     values: Vec<i32>,
@@ -33,7 +34,6 @@ struct Partial {
 pub fn compute_count_vectorizer_fit(
     corpus: Vec<String>,
     stopwords: FxHashSet<String>,
-    tokenizer: regex::Regex,
     n_chunks: usize,
 ) -> (FxHashMap<String, usize>, Vec<i32>, Vec<usize>, Vec<usize>) {
     let chunk_size = (corpus.len() / n_chunks).max(1);
@@ -58,12 +58,15 @@ pub fn compute_count_vectorizer_fit(
             indptr.push(0);
 
             let mut feature_counter: FxHashMap<usize, usize> = FxHashMap::default();
+            let mut token_buf: Vec<&str> = Vec::new();
 
             for text in chunk.iter() {
                 feature_counter.clear();
-                for m in tokenizer.find_iter(text) {
+                token_buf.clear();
+                tokenize::word_tokens(text, &mut token_buf);
+                for tok in token_buf.drain(..) {
                     // to lowercase transforms to String from str
-                    let token = m.as_str().to_lowercase();
+                    let token = tok.to_lowercase();
                     if stopwords.contains(&token) {
                         continue;
                     };
@@ -85,7 +88,10 @@ pub fn compute_count_vectorizer_fit(
                 }
                 indptr.push(j_indices.len());
             }
-            print_timing(&format!("count_vectorize_fit chunk_{idx}_{chunksize}"), chunk_start);
+            print_timing(
+                &format!("count_vectorize_fit chunk_{idx}_{chunksize}"),
+                chunk_start,
+            );
             Partial {
                 vocab,
                 values,
@@ -125,7 +131,6 @@ pub fn compute_count_vectorizer_transform(
     corpus: &[String],
     vocabulary: &FxHashMap<String, usize>,
     stopwords: &FxHashSet<String>,
-    tokenizer: &Regex,
     n_chunks: usize,
 ) -> (Vec<i32>, Vec<usize>, Vec<usize>) {
     let n_rows = corpus.len();
@@ -139,10 +144,13 @@ pub fn compute_count_vectorizer_transform(
             let mut indices: Vec<usize> = Vec::new();
             let mut indptr: Vec<usize> = Vec::with_capacity(chunk.len());
             let mut feature_counter: FxHashMap<usize, i32> = FxHashMap::default();
+            let mut token_buf: Vec<&str> = Vec::new();
             for text in chunk.iter() {
                 feature_counter.clear(); // reuse across rows: keeps capacity, one alloc per chunk
-                for m in tokenizer.find_iter(text) {
-                    let token = m.as_str().to_lowercase();
+                token_buf.clear();
+                tokenize::word_tokens(text, &mut token_buf);
+                for tok in token_buf.drain(..) {
+                    let token = tok.to_lowercase();
                     if stopwords.contains(&token) {
                         continue;
                     }
@@ -180,23 +188,20 @@ pub fn compute_count_vectorizer_transform(
     (data, indices, indptr)
 }
 #[pyfunction]
-#[pyo3(signature = (corpus, vocabulary, stopwords, token_pattern = r"(?u)\b\w\w+\b".to_string(), n_chunks = 1))]
+#[pyo3(signature = (corpus, vocabulary, stopwords, n_chunks = 1))]
 pub fn count_vectorize_transform(
     py: Python<'_>,
     corpus: Vec<String>,
     vocabulary: FxHashMap<String, usize>,
     stopwords: FxHashSet<String>,
-    token_pattern: String,
     n_chunks: usize,
 ) -> PyResult<(Py<PyArray1<i32>>, Py<PyArray1<i64>>, Py<PyArray1<i64>>)> {
     if n_chunks == 0 {
         return Err(PyValueError::new_err("n_chunks must be >= 1"));
     }
-    let tokenizer = Regex::new(&token_pattern)
-        .map_err(|e| PyValueError::new_err(format!("invalid token_pattern: {e}")))?;
 
-    let (data, indices, indptr) = py.allow_threads(|| {
-        compute_count_vectorizer_transform(&corpus, &vocabulary, &stopwords, &tokenizer, n_chunks)
+    let (data, indices, indptr) = py.detach(|| {
+        compute_count_vectorizer_transform(&corpus, &vocabulary, &stopwords, n_chunks)
     });
 
     let indices: Vec<i64> = indices.into_iter().map(|x| x as i64).collect();
@@ -209,11 +214,10 @@ pub fn count_vectorize_transform(
 }
 
 #[pyfunction]
-#[pyo3(signature = (corpus, stopwords, token_pattern = r"(?u)\b\w\w+\b".to_string(), n_chunks = 1))]
+#[pyo3(signature = (corpus, stopwords, n_chunks = 1))]
 pub fn count_vectorize_fit(
     corpus: Vec<String>,
     stopwords: FxHashSet<String>,
-    token_pattern: String,
     n_chunks: usize,
 ) -> PyResult<FxHashMap<String, usize>> {
     if n_chunks == 0 {
@@ -221,22 +225,18 @@ pub fn count_vectorize_fit(
             "n_chunks must be >= 1",
         ));
     }
-    let tokenizer = Regex::new(&token_pattern)
-        .map_err(|e| PyValueError::new_err(format!("invalid token_pattern: {e}")))?;
 
-    let (vocabulary, _, _, _) =
-        compute_count_vectorizer_fit(corpus, stopwords, tokenizer, n_chunks);
+    let (vocabulary, _, _, _) = compute_count_vectorizer_fit(corpus, stopwords, n_chunks);
 
     Ok(vocabulary)
 }
 
 #[pyfunction]
-#[pyo3(signature = (corpus, stopwords, token_pattern = r"(?u)\b\w\w+\b".to_string(), n_chunks = 1))]
+#[pyo3(signature = (corpus, stopwords, n_chunks = 1))]
 pub fn count_vectorize_fit_transform(
     py: Python<'_>,
     corpus: Vec<String>,
     stopwords: FxHashSet<String>,
-    token_pattern: String,
     n_chunks: usize,
 ) -> PyResult<(
     FxHashMap<String, usize>,
@@ -250,11 +250,9 @@ pub fn count_vectorize_fit_transform(
             "n_chunks must be >= 1",
         ));
     }
-    let tokenizer = Regex::new(&token_pattern)
-        .map_err(|e| PyValueError::new_err(format!("invalid token_pattern: {e}")))?;
 
     let (vocabulary, data, j_indices, indptr) =
-        compute_count_vectorizer_fit(corpus, stopwords, tokenizer, n_chunks);
+        compute_count_vectorizer_fit(corpus, stopwords, n_chunks);
 
     let data = data.into_pyarray(py).unbind();
     let indices = j_indices.into_pyarray(py).unbind();

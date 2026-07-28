@@ -2035,7 +2035,6 @@ dependencies = [
  "pyo3",
  "rand 0.9.4",
  "rayon",
- "regex",
  "rustc-hash",
  "rustls-webpki",
  "tar",
