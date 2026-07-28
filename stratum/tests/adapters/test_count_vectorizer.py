@@ -177,14 +177,16 @@ def test_n_jobs_above_cpu_count_capped_with_warning(caplog):
 @pytest.mark.parametrize(
     "corpus_len,n_jobs,expected",
     [
-        (5, 4, 1),
-        (MIN_BLOCK_LEN, 4, 1),
-        (MIN_BLOCK_LEN + 1, 4, 1),
-        (2 * MIN_BLOCK_LEN, 4, 2),
-        (10 * MIN_BLOCK_LEN, 4, 4),  # blocks would be 10, capped by n_jobs
+        (MIN_BLOCK_LEN, 4, 1),  # corpus smaller than n_jobs -> capped by corpus size
+        (3, 4, 3),  # corpus smaller than n_jobs -> capped by corpus size
+        (4, 4, 4),  # corpus equal to n_jobs -> full parallelism
+        (5, 4, 4),  # corpus bigger than n_jobs -> capped by n_jobs
+        (100, 4, 4),  # corpus bigger than n_jobs -> capped by n_jobs
     ],
 )
 def test_n_chunks_formula(corpus_len, n_jobs, expected):
+    # With MIN_BLOCK_LEN=1, n_chunks = min(corpus_len, n_jobs): parallelism is
+    # only limited by corpus size (never below it), otherwise by n_jobs.
     rv = RustyCountVectorizer(n_jobs=n_jobs)
     corpus = [""] * corpus_len
     assert rv._n_chunks(corpus) == expected
