@@ -11,7 +11,7 @@ from .. import _rust_backend as rb
 # File-internal config flags
 _DEBUG_INFO = False
 logger = logging.getLogger(__name__)
-MIN_BLOCK_LEN = 10_000
+MIN_BLOCK_LEN = 1
 _DEFAULT_TOKEN_PATTERN = r"(?u)\b\w\w+\b"
 
 
@@ -92,7 +92,7 @@ class RustyCountVectorizer(_SKCountVectorizer):
         if not self._rust_ready("count_vectorize_fit"):
             logger.warning("Rust disabled, fallback to scikit for fit")
             return super().fit(raw_documents, y)
-
+        t0 = rb.start_timing()
         corpus = list(raw_documents)
         try:
             vocab = rb.count_vectorize_fit(
@@ -109,6 +109,7 @@ class RustyCountVectorizer(_SKCountVectorizer):
             return super().fit(raw_documents, y)
 
         self.vocabulary_ = vocab
+        rb.print_timing("count_vectorize_transform", t0)
         return self
 
     def transform(self, raw_documents):
@@ -117,9 +118,9 @@ class RustyCountVectorizer(_SKCountVectorizer):
             return super().transform(raw_documents)
 
         check_is_fitted(self)
-
-        corpus = list(raw_documents)
         t0 = rb.start_timing()
+        corpus = list(raw_documents)
+        
         try:
             data, indices, indptr = rb.count_vectorize_transform(
                 corpus,
@@ -141,9 +142,9 @@ class RustyCountVectorizer(_SKCountVectorizer):
         if not self._rust_ready("count_vectorize_fit_transform"):
             logger.debug("Rust disabled, fallback to scikit for fit_transform")
             return super().fit_transform(raw_documents, y)
-
-        corpus = list(raw_documents)
         t0 = rb.start_timing()
+        corpus = list(raw_documents)
+        
         try:
             vocab, data, indices, indptr = rb.count_vectorize_fit_transform(
                 corpus,
@@ -159,9 +160,10 @@ class RustyCountVectorizer(_SKCountVectorizer):
                 f"Rust count_vectorize_fit_transform failed, falling back: {e}"
             )
             return super().fit_transform(raw_documents, y)
-        rb.print_timing("count_vectorize_fit_transform", t0)
 
         self.vocabulary_ = vocab
+        rb.print_timing("count_vectorize_fit_transform", t0)
+
         return csr_matrix(
             (data, indices, indptr),
             shape=(len(corpus), len(self.vocabulary_)),
