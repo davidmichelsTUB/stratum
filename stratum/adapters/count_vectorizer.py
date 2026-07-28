@@ -12,6 +12,40 @@ from .. import _rust_backend as rb
 _DEBUG_INFO = False
 logger = logging.getLogger(__name__)
 MIN_BLOCK_LEN = 10_000
+_DEFAULT_TOKEN_PATTERN = r"(?u)\b\w\w+\b"
+
+
+def supports_rust_count_vectorizer(estimator) -> tuple[bool, str]:
+    """Only sklearn's default CountVectorizer parameter set is supported by the
+    Rust kernel: word analyzer, unigrams, forced lowercasing, no vocabulary/df
+    pruning. Anything else must fall back to vanilla sklearn."""
+    if not isinstance(estimator, _SKCountVectorizer):
+        return False, "estimator is not a sklearn CountVectorizer"
+    if getattr(estimator, "analyzer", None) != "word":
+        return False, "analyzer must be 'word'"
+    if getattr(estimator, "tokenizer", None) is not None:
+        return False, "custom tokenizer not supported"
+    if getattr(estimator, "preprocessor", None) is not None:
+        return False, "custom preprocessor not supported"
+    if getattr(estimator, "lowercase", True) is not True:
+        return False, "lowercase=False not supported"
+    if getattr(estimator, "token_pattern", _DEFAULT_TOKEN_PATTERN) != _DEFAULT_TOKEN_PATTERN:
+        return False, "custom token_pattern not supported"
+    if getattr(estimator, "ngram_range", (1, 1)) != (1, 1):
+        return False, "ngram_range must be (1, 1)"
+    if getattr(estimator, "max_df", 1.0) != 1.0 or getattr(estimator, "min_df", 1) != 1:
+        return False, "max_df/min_df pruning not supported"
+    if getattr(estimator, "max_features", None) is not None:
+        return False, "max_features not supported"
+    if getattr(estimator, "binary", False):
+        return False, "binary=True not supported"
+    if getattr(estimator, "vocabulary", None) is not None:
+        return False, "fixed vocabulary not supported"
+    if getattr(estimator, "strip_accents", None) is not None:
+        return False, "strip_accents not supported"
+    if getattr(estimator, "input", "content") != "content":
+        return False, "input must be 'content'"
+    return True, ""
 
 
 class RustyCountVectorizer(_SKCountVectorizer):
@@ -41,12 +75,18 @@ class RustyCountVectorizer(_SKCountVectorizer):
 
     def _rust_ready(self, fn_name):
         rc = get_config()
-        return (
+        if not (
             rc.get("allow_patch", False)
             and rc.get("rust_backend", False)
             and rb.HAVE_RUST
             and getattr(rb, fn_name, None) is not None
-        )
+        ):
+            return False
+        supported, reason = supports_rust_count_vectorizer(self)
+        if not supported:
+            logger.debug(f"Rust fastpath not eligible: {reason}")
+            return False
+        return True
 
     def fit(self, raw_documents, y=None):
         if not self._rust_ready("count_vectorize_fit"):
@@ -58,7 +98,6 @@ class RustyCountVectorizer(_SKCountVectorizer):
             vocab = rb.count_vectorize_fit(
                 corpus,
                 self._stopwords_set(),
-                self.token_pattern,
                 self._n_chunks(corpus),
             )
             if len(vocab) == 0:
@@ -86,7 +125,6 @@ class RustyCountVectorizer(_SKCountVectorizer):
                 corpus,
                 self.vocabulary_,
                 self._stopwords_set(),
-                self.token_pattern,
                 self._n_chunks(corpus),
             )
         except Exception as e:
@@ -110,7 +148,6 @@ class RustyCountVectorizer(_SKCountVectorizer):
             vocab, data, indices, indptr = rb.count_vectorize_fit_transform(
                 corpus,
                 self._stopwords_set(),
-                self.token_pattern,
                 self._n_chunks(corpus),
             )
             if len(vocab) == 0:

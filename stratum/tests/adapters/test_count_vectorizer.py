@@ -12,7 +12,11 @@ from sklearn.feature_extraction.text import CountVectorizer as SKCountVectorizer
 from stratum import _rust_backend as rb
 from stratum import set_config
 from stratum._config import get_config
-from stratum.adapters.count_vectorizer import MIN_BLOCK_LEN, RustyCountVectorizer
+from stratum.adapters.count_vectorizer import (
+    MIN_BLOCK_LEN,
+    RustyCountVectorizer,
+    supports_rust_count_vectorizer,
+)
 
 requires_rust = pytest.mark.skipif(not rb.HAVE_RUST, reason="Rust backend not built")
 REAL_SENTENCES = [
@@ -257,3 +261,123 @@ def test_transform_without_fit_raises():
     rv = RustyCountVectorizer()
     with pytest.raises(NotFittedError):
         rv.transform(["hello world"])
+
+
+# ---------------------------------------------------------------------------
+# Fastpath eligibility gating (non-default CountVectorizer parameters)
+# ---------------------------------------------------------------------------
+
+
+@requires_rust
+def test_fastpath_eligible_for_default_params(capfd):
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
+    rv = RustyCountVectorizer()
+    supported, reason = supports_rust_count_vectorizer(rv)
+    assert supported, reason
+
+    _ = rv.fit_transform(REAL_SENTENCES)
+    assert "[rust]" in capture_std_out(capfd)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"analyzer": "char"},
+        {"ngram_range": (1, 2)},
+        {"tokenizer": str.split},
+        {"preprocessor": str.lower},
+        {"lowercase": False},
+        {"token_pattern": r"(?u)\b\w+\b"},
+        {"max_df": 0.9},
+        {"min_df": 2},
+        {"max_features": 5},
+        {"binary": True},
+        {"vocabulary": {"the": 0, "is": 1}},
+        {"strip_accents": "unicode"},
+    ],
+    ids=[
+        "analyzer_char",
+        "ngram_range",
+        "custom_tokenizer",
+        "custom_preprocessor",
+        "lowercase_false",
+        "custom_token_pattern",
+        "max_df",
+        "min_df",
+        "max_features",
+        "binary",
+        "fixed_vocabulary",
+        "strip_accents",
+    ],
+)
+@requires_rust
+@pytest.mark.filterwarnings(
+    "ignore:The parameter 'token_pattern' will not be used since 'tokenizer' is not None:UserWarning"
+)
+def test_fastpath_falls_back_for_nondefault_params(kwargs, capfd):
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
+
+    rv = RustyCountVectorizer(**kwargs)
+    supported, _ = supports_rust_count_vectorizer(rv)
+    assert not supported
+
+    Z = rv.fit_transform(REAL_SENTENCES)
+    assert Z.shape[0] == len(REAL_SENTENCES)
+    assert "[rust]" not in capture_std_out(capfd)
+
+
+
+
+@requires_rust
+@pytest.mark.filterwarnings(
+    "ignore:The parameter 'token_pattern' will not be used since 'tokenizer' is not None:UserWarning"
+)
+def test_automatic_fallback_with_custom_tokenizer(capfd):
+    """A custom `tokenizer` callable can't be executed by the Rust kernel, so
+    fit_transform must transparently fall back to sklearn and still produce
+    the correct (sklearn-matching) result."""
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
+
+    rv = RustyCountVectorizer(tokenizer=str.split)
+    Z = rv.fit_transform(REAL_SENTENCES)
+
+    sk = SKCountVectorizer(tokenizer=str.split)
+    Z_ref = sk.fit_transform(REAL_SENTENCES)
+
+    assert rv.vocabulary_ == sk.vocabulary_
+    np.testing.assert_array_equal(Z.toarray(), Z_ref.toarray())
+    assert "[rust]" not in capture_std_out(capfd)
+
+
+@requires_rust
+def test_automatic_fallback_with_custom_preprocessor(capfd):
+    """A custom `preprocessor` callable is likewise unsupported by the Rust
+    kernel and must trigger a transparent fallback to sklearn."""
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
+
+    rv = RustyCountVectorizer(preprocessor=str.lower)
+    Z = rv.fit_transform(REAL_SENTENCES)
+
+    sk = SKCountVectorizer(preprocessor=str.lower)
+    Z_ref = sk.fit_transform(REAL_SENTENCES)
+
+    assert rv.vocabulary_ == sk.vocabulary_
+    np.testing.assert_array_equal(Z.toarray(), Z_ref.toarray())
+    assert "[rust]" not in capture_std_out(capfd)
+
+
+@requires_rust
+def test_automatic_fallback_with_non_default_ngram_range(capfd):
+    """ngram_range other than (1, 1) isn't implemented in the Rust kernel
+    (unigrams only), so it must trigger a transparent fallback to sklearn."""
+    set_config(rust_backend=True, allow_patch=True, debug_timing=True)
+
+    rv = RustyCountVectorizer(ngram_range=(1, 2))
+    Z = rv.fit_transform(REAL_SENTENCES)
+
+    sk = SKCountVectorizer(ngram_range=(1, 2))
+    Z_ref = sk.fit_transform(REAL_SENTENCES)
+
+    assert rv.vocabulary_ == sk.vocabulary_
+    np.testing.assert_array_equal(Z.toarray(), Z_ref.toarray())
+    assert "[rust]" not in capture_std_out(capfd)
