@@ -1,23 +1,28 @@
-from stratum.optimizer.ir._ops import (OperandRef, OutputType, is_frame_like, BaseEstimatorOp, BinOp, CallOp, ChoiceOp, GetAttrOp, GetItemOp,
-                                       MethodCallOp, Op, ValueOp)
+from stratum.optimizer.ir._ops import (OperandRef, OutputType, is_frame_like, BaseEstimatorOp, BinOp, UnaryOp, CallOp, ChoiceOp, GetAttrOp, GetItemOp,
+                                       MethodCallOp, Op, TransformerOp, ValueOp)
 from pandas import DataFrame
 from polars import DataFrame as PolarsDataFrame
+from skrub import SelectCols
 import pandas as pd
-import polars as pl
 import numpy as np
-from stratum._config import FLAGS
 
 # Per-category frame ops. These are imported here both because the
 # `extract_dataframe_op` dispatcher below references them and so that existing
 # `from ..._dataframe_ops import X` import sites keep working (re-export hub).
 from stratum.optimizer.ir._source_ops import DataSourceOp, make_read_op
+from stratum.optimizer.ir._selection_ops import (
+    SelectionKind, SelectionOp, _SELECTION_METHODS, make_selection_op,
+    is_mask_selection, make_mask_selection_op)
 from stratum.optimizer.ir._aggregation_ops import (
     AggregateOp, GroupedDataframeOp, _AGG_METHODS, _AGG_FUNCS, _is_groupby_op,
     _is_aggregation, _extract_grouping, _extract_aggregations, make_aggregate_op)
 from stratum.optimizer.ir._projection_ops import (
-    MetadataOp, ProjectionOp, DropOp, ApplyUDFOp, AssignOp, DatetimeConversionOp,
-    GetAttrProjectionOp, StringMethodOp, make_datetime_conversion_op,
-    make_frame_get_attr, make_string_method_op)
+    ColumnProjectionOp, ColumnSelectorOp, MetadataOp, ProjectionOp, DropOp,
+    ApplyUDFOp, AssignOp, DatetimeConversionOp, GetAttrProjectionOp,
+    StringMethodOp, make_column_projection_op, make_column_selector_op,
+    make_datetime_conversion_op, make_frame_get_attr, make_string_method_op,
+    resolve_selector_columns)
+from stratum.optimizer.ir._map_ops import MapOp, AssignMapOp, make_assign_map_op
 from stratum.optimizer.ir._join_ops import (
     JoinOp, _MERGE_POSITIONAL, _JOIN_POSITIONAL, _JOIN_OP_FIELDS, make_join_op,
     _make_chained_join_op)
@@ -25,28 +30,21 @@ from stratum.optimizer.ir._split_ops import SplitOp, SplitOutput, add_splitting_
 
 
 class ConcatOp(Op):
+    """Logical frame concatenation. Pure config -- execution is provided by the
+    physical impls in ``physical/_concat_execs.py`` (Pandas/PolarsConcatOp),
+    selected at plan time."""
+    logical_family = "Concat"
     fields = ["first", "others", "axis"] # Add more if needed
 
-    axis_map = {
-        0: "diagonal_relaxed",
-        1: "horizontal",
-    }
     def __init__(self, first, others: list, axis):
-        super().__init__(name="CONCAT", is_X=False, is_y=False)
+        # No name: the "Concat" family label alone renders cleanly (avoids the
+        # redundant "Concat(CONCAT)").
+        super().__init__(name="", is_X=False, is_y=False)
         # first/others entries/axis are OperandRefs when graph-fed, else constants.
         self.first = first
         self.others = list(others)
         self.axis = axis
         self.output_type = OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        first = inputs[self.first.k] if isinstance(self.first, OperandRef) else self.first
-        others = [inputs[o.k] if isinstance(o, OperandRef) else o for o in self.others]
-        axis = inputs[self.axis.k] if isinstance(self.axis, OperandRef) else self.axis
-        if FLAGS.force_polars:
-            return pl.concat([first, *others], how=self.axis_map[axis])
-        else:
-            return pd.concat([first, *others], axis=axis)
 
 
 def _getitem_output_type(op: GetItemOp) -> OutputType:
@@ -67,7 +65,24 @@ def _getitem_output_type(op: GetItemOp) -> OutputType:
     return OutputType.FRAME
 
 
-def extract_dataframe_op(op: Op, root: Op) -> tuple[Op, bool]:
+def _is_column_projection(op: GetItemOp) -> bool:
+    """Whether a ``df[key]`` GetItem selects columns by literal name(s).
+
+    True only when the container is a ``FRAME`` and the key is a literal column
+    label (``str``) or list of labels (``list[str]``). A graph-fed key (an
+    :class:`OperandRef`), a slice, an integer/positional key, a boolean-mask list
+    or a ``SERIES`` container all fall through to the general ``GetItemOp``.
+    """
+    if op.inputs[0].output_type is not OutputType.FRAME:
+        return False
+    key = op.key
+    if isinstance(key, str):
+        return True
+    return isinstance(key, list) and all(isinstance(k, str) for k in key)
+
+
+def extract_dataframe_op(op: Op, root: Op, selection_op = True, map_op = True,
+                         column_projection = True) -> tuple[Op, bool]:
     new_op = None
     # DataSource detection (directly passed dataframe)
     if len(op.inputs) == 0:
@@ -122,26 +137,51 @@ def extract_dataframe_op(op: Op, root: Op) -> tuple[Op, bool]:
                 new_op.output_type = op.inputs[0].output_type
                 op.replace_output_of_inputs(new_op)
             elif op.method_name in ["assign"]:
-                new_op = AssignOp(args=op.args, kwargs=op.kwargs, inputs=op.inputs, outputs=op.outputs)
-                op.replace_output_of_inputs(new_op)
+                if map_op:
+                    new_op = make_assign_map_op(op)
+                if new_op is None:
+                    # Not foldable (positional args / sequence-valued constant
+                    # kwargs): keep the opaque assign.
+                    new_op = AssignOp(args=op.args, kwargs=op.kwargs, inputs=op.inputs, outputs=op.outputs)
+                    op.replace_output_of_inputs(new_op)
             elif op.method_name in ["join", "merge"]:
                 new_op = make_join_op(op)
+            elif op.method_name in _SELECTION_METHODS:
+                new_op = make_selection_op(op)
 
         # GetAttr Fusing and conversion to GetAttrDataframeOp
         elif isinstance(op, GetAttrOp):
             new_op = make_frame_get_attr(new_op, op)
 
-        # Projection: a BinOp over tabular data -> same tabular kind as its operand
-        # (e.g. `df["a"] > 7` is a SERIES, `df + 1` is a FRAME).
-        elif isinstance(op, BinOp):
+        # Projection: BinOp/UnaryOp over tabular data -> same tabular kind as its
+        # operand (e.g. `df["a"] > 7` is a SERIES, `df + 1` is a FRAME, `~mask` is
+        # a SERIES).
+        elif isinstance(op, (BinOp, UnaryOp)):
             op.output_type = op.inputs[0].output_type
 
-        # GetItem: a column projection (SERIES) / sub-frame / row selection.
+        # GetItem: a mask selection df[bool_series] folds into a SelectionOp;
+        # otherwise it is a column projection (SERIES) / sub-frame / row selection.
         elif isinstance(op, GetItemOp):
-            op.output_type = _getitem_output_type(op)
+            if is_mask_selection(op):
+                op.is_filter = True
+                if selection_op:
+                    new_op = make_mask_selection_op(op)
+            elif column_projection and _is_column_projection(op):
+                # A literal column selection df["a"] / df[["a", "b"]] on a frame
+                # becomes a dedicated ColumnProjectionOp; GetItem stays the
+                # fallback for masks, graph-fed keys, slices and positional keys.
+                new_op = make_column_projection_op(op)
+
+            if new_op is None:
+                op.output_type = _getitem_output_type(op)
 
         elif isinstance(op, BaseEstimatorOp):
             op.output_type = OutputType.FRAME
+            # skrub implements `skb.select(cols)` as an Apply of its SelectCols
+            # transformer; surface the selector as a dedicated ColumnSelectorOp.
+            if (isinstance(op, TransformerOp) and isinstance(op.estimator, SelectCols)
+                    and not op.param_refs and not isinstance(op.y, OperandRef)):
+                new_op = make_column_selector_op(op)
 
         elif isinstance(op, ChoiceOp):
             # Propagate a shared frame type across all outcomes; mixed kinds fall

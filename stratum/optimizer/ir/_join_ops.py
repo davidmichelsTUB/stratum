@@ -1,9 +1,11 @@
 from collections.abc import Sequence
 from stratum.optimizer.ir._ops import OperandRef, OutputType, MethodCallOp, Op
-from stratum._config import FLAGS
 
 
 class JoinOp(Op):
+    """Logical join. Pure config -- execution is provided by the physical impls
+    in ``physical/_join_execs.py`` (Pandas/PolarsJoinOp), selected at plan time."""
+    logical_family = "Join"
     fields = ["how", "left_on", "right_on", "left_index", "right_index", "suffixes"]
 
     def __init__(
@@ -25,25 +27,6 @@ class JoinOp(Op):
         self.right_index = right_index
         self.suffixes = suffixes
         self.output_type = OutputType.FRAME
-
-    def process(self, mode: str, inputs: list):
-        if len(inputs) != 2:
-            raise ValueError(f"JoinOp expects exactly 2 inputs (left and right dataframes), got {len(inputs)}.")
-        left_df = inputs[0]
-        right_df = inputs[1]
-
-        if FLAGS.force_polars:
-            raise NotImplementedError("JoinOp Polars backend is not implemented yet.")
-        else:
-            return left_df.merge(
-                right_df,
-                left_on=self.left_on,
-                right_on=self.right_on,
-                how=self.how,
-                suffixes=self.suffixes,
-                left_index=self.left_index,
-                right_index=self.right_index
-            )
 
 
 _MERGE_POSITIONAL = ["how", "on", "left_on", "right_on",

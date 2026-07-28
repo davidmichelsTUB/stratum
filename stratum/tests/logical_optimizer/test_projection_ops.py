@@ -5,13 +5,19 @@ import pandas as pd
 import polars as pl
 import stratum as st
 from stratum.optimizer._optimize import OptConfig
+from skrub import selectors
 from stratum.optimizer.ir._projection_ops import (
-    ApplyUDFOp, AssignOp, DatetimeConversionOp, DropOp, GetAttrProjectionOp,
-    MetadataOp, ProjectionOp, StringMethodOp, make_datetime_conversion_op)
-from stratum.optimizer.ir._ops import (CallOp, GetItemOp, MethodCallOp, OperandRef,
-                                       OutputType)
+    ApplyUDFOp, AssignOp, ColumnProjectionOp, ColumnSelectorOp,
+    DatetimeConversionOp, DropOp, GetAttrProjectionOp, MetadataOp, ProjectionOp,
+    StringMethodOp, make_datetime_conversion_op, make_frame_get_attr,
+    make_string_method_op, polars_datetime_kwargs)
+from stratum.optimizer.ir._map_ops import AssignMapOp
+from stratum.optimizer.ir._column_expr import Col, DtExpr
+from stratum.optimizer.ir._ops import (
+    CallOp, GetAttrOp, GetItemOp, MethodCallOp, Op, OperandRef, OutputType,
+    TransformerOp)
 from stratum.tests.logical_optimizer.test_dataframe_ops import (
-    PolarsTestCase, _inp, _inputs_for, force_polars, optimize, run_op)
+    PolarsTestCase, _inp, _inputs_for, force_polars, make_map_op, optimize, run_op)
 
 
 class TestProjectionRewrites(unittest.TestCase):
@@ -45,7 +51,7 @@ class TestProjectionRewrites(unittest.TestCase):
         root = st.choose_from([sub_dag1, sub_dag2]).as_data_op()
         ops = optimize(root)
         self.assertEqual(5, len(ops))
-        self.assertIsInstance(ops[1], GetItemOp)
+        self.assertIsInstance(ops[1], ColumnProjectionOp)
         self.assertIsInstance(ops[3], ProjectionOp)
 
     def test_fused_get_attr(self):
@@ -55,13 +61,78 @@ class TestProjectionRewrites(unittest.TestCase):
                            month=data["datetime"].dt.month)
         data = data.copy()
         ops = optimize(data)
-        self.assertEqual(8, len(ops))
-        op_iter = iter(ops[3:])
-        next(op_iter)
-        self.assertIsInstance(next(op_iter), GetAttrProjectionOp)
-        self.assertIsInstance(next(op_iter), GetAttrProjectionOp)
-        self.assertIsInstance(next(op_iter), AssignOp)
-        self.assertIsInstance(next(op_iter), MethodCallOp)
+        # The column getitem and both fused .dt accessors fold into the assign map.
+        self.assertEqual(5, len(ops))
+        map_op = next(o for o in ops if isinstance(o, AssignMapOp))
+        self.assertEqual({"year": DtExpr(Col("datetime"), "year"),
+                          "month": DtExpr(Col("datetime"), "month")},
+                         map_op.entries)
+        self.assertIsInstance(ops[-1], MethodCallOp)  # the trailing .copy()
+
+
+class TestColumnProjectionOp(unittest.TestCase):
+    """A column-selecting ``df[key]`` on a frame parses to a ColumnProjectionOp;
+    the general GetItemOp stays the fallback for everything else."""
+
+    def setUp(self):
+        self.df = pd.DataFrame({"x": [1, 2, 3], "y": [4, 5, 6]})
+
+    def _ops(self, data_op):
+        return optimize(data_op, OptConfig(dataframe_ops=True))
+
+    def test_single_column_parses_to_series_projection(self):
+        ops = self._ops(st.as_data_op(self.df)["x"])
+        proj = [o for o in ops if isinstance(o, ColumnProjectionOp)]
+        self.assertEqual(1, len(proj))
+        self.assertEqual("x", proj[0].key)
+        self.assertIs(OutputType.SERIES, proj[0].output_type)
+        self.assertFalse(any(isinstance(o, GetItemOp) for o in ops))
+
+    def test_column_list_parses_to_frame_projection(self):
+        ops = self._ops(st.as_data_op(self.df)[["x", "y"]])
+        proj = [o for o in ops if isinstance(o, ColumnProjectionOp)]
+        self.assertEqual(1, len(proj))
+        self.assertEqual(["x", "y"], proj[0].key)
+        self.assertIs(OutputType.FRAME, proj[0].output_type)
+
+    def test_graph_fed_key_stays_getitem(self):
+        # A key fed from another data-op is an OperandRef, not a literal column
+        # name, so it is not a column projection -> stays a GetItemOp fallback.
+        ops = self._ops(st.as_data_op(self.df)[st.as_data_op("x")])
+        self.assertFalse(any(isinstance(o, ColumnProjectionOp) for o in ops))
+        self.assertTrue(any(isinstance(o, GetItemOp) for o in ops))
+
+    def test_toggle_off_keeps_getitem(self):
+        with st.config(make_column_projection=False):
+            ops = self._ops(st.as_data_op(self.df)["x"])
+        self.assertFalse(any(isinstance(o, ColumnProjectionOp) for o in ops))
+        self.assertTrue(any(isinstance(o, GetItemOp) for o in ops))
+
+    def test_clone_derives_output_type_from_key(self):
+        self.assertIs(OutputType.SERIES, ColumnProjectionOp(key="x").clone().output_type)
+        self.assertIs(OutputType.FRAME, ColumnProjectionOp(key=["x", "y"]).clone().output_type)
+
+    def test_execute_single_column_pandas(self):
+        result = run_op(ColumnProjectionOp(key="x"), self.df)
+        self.assertIsInstance(result, pd.Series)
+        self.assertEqual([1, 2, 3], result.tolist())
+
+    def test_execute_column_list_pandas(self):
+        result = run_op(ColumnProjectionOp(key=["x", "y"]), self.df)
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertEqual(["x", "y"], list(result.columns))
+
+    def test_execute_single_column_polars(self):
+        with force_polars():
+            result = run_op(ColumnProjectionOp(key="x"), pl.from_pandas(self.df))
+        self.assertIsInstance(result, pl.Series)
+        self.assertEqual([1, 2, 3], result.to_list())
+
+    def test_execute_column_list_polars(self):
+        with force_polars():
+            result = run_op(ColumnProjectionOp(key=["x", "y"]), pl.from_pandas(self.df))
+        self.assertIsInstance(result, pl.DataFrame)
+        self.assertEqual(["x", "y"], result.columns)
 
 
 class TestMetadataOp(unittest.TestCase):
@@ -85,6 +156,10 @@ class TestProjectionOp(unittest.TestCase):
     def test_func_and_method_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
             ProjectionOp(func=lambda x: x, method="drop", args=(), kwargs={})
+
+    def test_kwargs_can_be_omitted(self):
+        op = ProjectionOp(method="copy", args=(), kwargs=None)
+        self.assertIsNone(op.kwargs)
 
     def test_no_func_no_method_raises(self):
         with self.assertRaises(TypeError):
@@ -184,6 +259,41 @@ class TestDatetimeConversionOp(unittest.TestCase):
             result = run_op(op, pl.Series("dt", ["2025-01-01", "2025-06-15"]))
             self.assertEqual(pl.Datetime, result.dtype)
 
+    def test_pandas_path_preserves_kwargs(self):
+        op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+        result = run_op(op, pd.Series(["01/02/2020"]))
+        self.assertEqual(pd.Timestamp("2020-02-01"), result.iloc[0])
+
+    def test_polars_unsupported_kwargs_use_pandas_semantics(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, pl.Series("dt", ["01/02/2020"]))
+        self.assertEqual([pd.Timestamp("2020-02-01")], result.to_list())
+
+    def test_polars_positional_options_use_pandas_semantics(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=("coerce",), kwargs={})
+            result = run_op(op, pl.Series("dt", ["2025-01-01", "bad"]))
+        self.assertEqual([pd.Timestamp("2025-01-01"), None], result.to_list())
+
+    def test_polars_fallback_converts_datetime_index(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, ["01/02/2020", "03/04/2021"])
+        self.assertEqual(
+            [pd.Timestamp("2020-02-01"), pd.Timestamp("2021-04-03")],
+            result.to_list())
+
+    def test_polars_fallback_keeps_scalar_result(self):
+        with force_polars():
+            op = DatetimeConversionOp(args=(), kwargs={"dayfirst": True})
+            result = run_op(op, "01/02/2020")
+        self.assertEqual(pd.Timestamp("2020-02-01"), result)
+
+    def test_polars_datetime_kwargs_rejects_unsupported_errors(self):
+        self.assertIsNone(
+            polars_datetime_kwargs((), {"errors": "ignore"}))
+
 
 class TestGetAttrProjectionOp(unittest.TestCase):
     def test_init_with_none(self):
@@ -195,8 +305,8 @@ class TestGetAttrProjectionOp(unittest.TestCase):
     def _run_polars(self, dt_values, attr_name):
         with force_polars():
             s = pl.Series("dt", pd.to_datetime(dt_values))
-            op = GetAttrProjectionOp(attr_name=attr_name, inputs=[_inp(s)], outputs=[])
-            return op.process("fit_transform", _inputs_for(op))
+            op = GetAttrProjectionOp(attr_name=attr_name)
+            return run_op(op, s)
 
     def test_polars_year(self):
         result = self._run_polars(["2025-01-15", "2025-06-20"], ["dt", "year"])
@@ -211,6 +321,27 @@ class TestGetAttrProjectionOp(unittest.TestCase):
         result = self._run_polars(["2025-01-31", "2025-01-15"],
                                   ["dt", "is_month_end"])
         self.assertEqual([True, False], result.to_list())
+
+    def test_polars_single_accessor_returns_namespace(self):
+        result = self._run_polars(["2025-01-15"], ["dt"])
+        self.assertEqual([2025], result.year().to_list())
+
+    def test_shared_accessor_keeps_original_edge_when_fused(self):
+        source = Op()
+        source.output_type = OutputType.SERIES
+        accessor = GetAttrProjectionOp(
+            attr_name=["dt"], inputs=[source], outputs=[])
+        current = GetAttrOp(attr_name="year")
+        current.inputs = [accessor]
+        other_consumer = Op(inputs=[accessor])
+        accessor.outputs = [current, other_consumer]
+        source.outputs = [accessor]
+
+        new_op = make_frame_get_attr(None, current)
+
+        self.assertEqual([other_consumer], accessor.outputs)
+        self.assertIn(accessor, source.outputs)
+        self.assertIn(new_op, source.outputs)
 
 
 class TestStringMethodOp(unittest.TestCase):
@@ -227,13 +358,16 @@ class TestStringMethodOp(unittest.TestCase):
     def test_str_method_fuses_accessor_away(self):
         # A str call used as a column projection (here assigned) becomes a single
         # StringMethodOp; the GetAttrProjectionOp(["str"]) accessor drops out.
+        # Map folding is disabled so the intermediate op stays observable (with it
+        # on, the assign absorbs the call into a StrExpr entry -- see test_map_ops).
         data = st.as_data_op(self.df)
-        ops = optimize(data.assign(c=data["s"].str.upper()),
-                       OptConfig(dataframe_ops=True))
+        with make_map_op(False):
+            ops = optimize(data.assign(c=data["s"].str.upper()),
+                           OptConfig(dataframe_ops=True))
         sm = self._one(ops, StringMethodOp)
         self.assertEqual("upper", sm.method)
         self.assertIs(OutputType.SERIES, sm.output_type)
-        self.assertIsInstance(sm.inputs[0], GetItemOp)  # the column, not the accessor
+        self.assertIsInstance(sm.inputs[0], ColumnProjectionOp)  # the column, not the accessor
         self.assertEqual([], [o for o in ops if isinstance(o, GetAttrProjectionOp)])
 
     def test_shared_accessor_detached_after_last_call(self):
@@ -241,8 +375,9 @@ class TestStringMethodOp(unittest.TestCase):
         # StringMethodOp and the accessor is removed once its last consumer is fused.
         data = st.as_data_op(self.df)
         acc = data["s"].str
-        ops = optimize(data.assign(a=acc.count("1"), b=acc.upper()),
-                       OptConfig(dataframe_ops=True))
+        with make_map_op(False):
+            ops = optimize(data.assign(a=acc.count("1"), b=acc.upper()),
+                           OptConfig(dataframe_ops=True))
         self.assertEqual(2, len([o for o in ops if isinstance(o, StringMethodOp)]))
         self.assertEqual([], [o for o in ops if isinstance(o, GetAttrProjectionOp)])
 
@@ -257,6 +392,89 @@ class TestStringMethodOp(unittest.TestCase):
             op = StringMethodOp(method="count", args=("1",))
             result = run_op(op, pl.Series(["a1", "bb", "c1"]))
         self.assertEqual([1, 0, 1], result.to_list())
+
+    def test_graph_argument_is_rewired_to_fused_method(self):
+        column = Op()
+        column.output_type = OutputType.SERIES
+        accessor = GetAttrProjectionOp(
+            attr_name=["str"], inputs=[column], outputs=[])
+        argument = Op()
+        call = MethodCallOp(
+            method_name="contains", args=(OperandRef(1),), kwargs={})
+        call.inputs = [accessor, argument]
+        accessor.outputs = [call]
+        argument.outputs = [call]
+        column.outputs = [accessor]
+
+        new_op = make_string_method_op(call)
+
+        self.assertIn(new_op, argument.outputs)
+        self.assertNotIn(call, argument.outputs)
+
+
+class TestColumnSelectorExtraction(unittest.TestCase):
+    """skb.select(selector) -- an Apply of SelectCols -- becomes a ColumnSelectorOp."""
+
+    def setUp(self):
+        self.df = pd.DataFrame({"a": [1.0, 2.0], "s": ["x", "y"]})
+
+    def _one(self, ops, cls):
+        found = [o for o in ops if isinstance(o, cls)]
+        self.assertEqual(1, len(found), f"expected exactly one {cls.__name__}")
+        return found[0]
+
+    def test_select_converts_to_column_selector(self):
+        data = st.as_data_op(self.df)
+        sel = selectors.numeric()
+        ops = optimize(data.skb.select(sel), OptConfig(dataframe_ops=True))
+        col_sel = self._one(ops, ColumnSelectorOp)
+        self.assertIs(sel, col_sel.selector)
+        self.assertIs(OutputType.FRAME, col_sel.output_type)
+        # the SelectCols TransformerOp is fully replaced
+        self.assertEqual([], [o for o in ops if isinstance(o, TransformerOp)])
+
+    def test_select_by_names_converts(self):
+        data = st.as_data_op(self.df)
+        ops = optimize(data.skb.select(["a"]), OptConfig(dataframe_ops=True))
+        self.assertEqual(["a"], self._one(ops, ColumnSelectorOp).selector)
+
+
+class TestColumnSelectorProcess(unittest.TestCase):
+    """ColumnSelectorOp resolves the selector at fit and reuses the list at predict."""
+
+    def test_fit_resolves_and_selects_pandas(self):
+        op = ColumnSelectorOp(selector=selectors.numeric())
+        result = run_op(op, pd.DataFrame({"a": [1.0], "s": ["x"]}))
+        self.assertEqual(["a"], list(result.columns))
+        self.assertEqual(["a"], op.selected_columns)
+
+    def test_predict_reuses_stored_columns(self):
+        # A new numeric column appearing at predict time is NOT picked up: the
+        # fit-time resolution is what transforms (SelectCols semantics).
+        op = ColumnSelectorOp(selector=selectors.numeric())
+        run_op(op, pd.DataFrame({"a": [1.0], "s": ["x"]}))
+        result = run_op(op, pd.DataFrame({"a": [2.0], "b": [3.0], "s": ["y"]}),
+                        mode="predict")
+        self.assertEqual(["a"], list(result.columns))
+
+    def test_predict_before_fit_raises(self):
+        op = ColumnSelectorOp(selector=selectors.numeric())
+        with self.assertRaises(RuntimeError):
+            run_op(op, pd.DataFrame({"a": [1.0]}), mode="predict")
+
+    def test_polars(self):
+        op = ColumnSelectorOp(selector=selectors.numeric())
+        with force_polars():
+            result = run_op(op, pl.DataFrame({"a": [1.0], "s": ["x"]}))
+        self.assertEqual(["a"], result.columns)
+
+    def test_clone_resets_resolution(self):
+        # Cloning happens in the logical phase (choice unrolling), before impl
+        # selection; a cloned ColumnSelectorOp is a fresh logical op that carries
+        # no resolved column list.
+        op = ColumnSelectorOp(selector=selectors.numeric())
+        op.selected_columns = ["a"]  # even if the original were somehow resolved
+        self.assertIsNone(op.clone().selected_columns)
 
 
 class TestMakeDatetimeConversionOp(unittest.TestCase):

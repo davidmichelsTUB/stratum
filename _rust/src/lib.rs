@@ -121,7 +121,7 @@ fn compute_fd_embed(
 
     // Step 3: Build Ω (d x out_w), but don't store full Ω. Generate on the fly per-column.
     // We pre-allocate Ω^T as Vec<Vec<f32>>; width is small (<= 128).
-    // Do all heavy work without the GIL (allow_threads closure)
+    // Do all heavy work without the GIL (detach closure)
     // TODO: Avoid materializing omega. Stream random f32 numbers in during building Y
     let mut rng = StdRng::seed_from_u64(s);
     let mut omega_t: Vec<Vec<f32>> = Vec::with_capacity(out_w);
@@ -191,10 +191,8 @@ fn fd_embed_from_csr(
     let indices = unsafe { indices.as_slice()? };
     let indptr = unsafe { indptr.as_slice()? };
 
-    let z = py
-        .allow_threads(|| {
-            compute_fd_embed(data, indices, indptr, n_rows, n_cols, k, oversample, seed)
-        })
+    let z = py.detach(||
+        compute_fd_embed(data, indices, indptr, n_rows, n_cols, k, oversample, seed))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_embed failed: {e}")))?;
 
     // Step 6: Return NumPy (zero-copy)
@@ -274,9 +272,7 @@ fn fd_fit_from_csr(
     let indptr = unsafe { indptr.as_slice()? };
 
     let (model_id, z) = py
-        .allow_threads(|| {
-            compute_fd_fit(data, indices, indptr, n_rows, n_cols, k, oversample, seed)
-        })
+        .detach(|| compute_fd_fit(data, indices, indptr, n_rows, n_cols, k, oversample, seed))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_fit failed: {e}")))?;
 
     // Return NumPy (zero-copy)
@@ -369,10 +365,8 @@ fn fd_transform_from_csr(
     let indptr = unsafe { indptr.as_slice()? };
 
     let z = py
-        .allow_threads(|| compute_fd_transform(model_id, data, indices, indptr, n_rows, n_cols))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("fd_transform failed: {e}"))
-        })?;
+        .detach(|| compute_fd_transform(model_id, data, indices, indptr, n_rows, n_cols))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("fd_transform failed: {e}")))?;
 
     let py_z = z.into_pyarray(py).to_owned();
     Ok(Py::from(py_z))
@@ -429,11 +423,9 @@ fn truncated_svd_fit_from_csr(
     let indices = unsafe { indices.as_slice()? };
     let indptr = unsafe { indptr.as_slice()? };
 
-    let (model_id, z) = py
-        .allow_threads(|| compute_truncated_svd_fit(data, indices, indptr, n_rows, n_cols, k, seed))
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("truncated_svd_fit failed: {e}"))
-        })?;
+    let (model_id, z) = py.detach(||
+        compute_truncated_svd_fit(data, indices, indptr, n_rows, n_cols, k, seed))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("truncated_svd_fit failed: {e}")))?;
 
     // Step 2: Return NumPy (zero-copy)
     let py_z = z.into_pyarray(py).to_owned();
@@ -497,14 +489,8 @@ fn truncated_svd_transform_from_csr(
     let indptr = unsafe { indptr.as_slice()? };
 
     let z = py
-        .allow_threads(|| {
-            compute_truncated_svd_transform(model_id, data, indices, indptr, n_rows, n_cols)
-        })
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "truncated_svd_transform failed: {e}"
-            ))
-        })?;
+        .detach(|| compute_truncated_svd_transform(model_id, data, indices, indptr, n_rows, n_cols))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("truncated_svd_transform failed: {e}")))?;
 
     let py_z = z.into_pyarray(py).to_owned();
     Ok(Py::from(py_z))
@@ -544,13 +530,11 @@ fn hashing_tfidf_csr(
 
     // Work buffers to be produced by tfidf::build_csr
     // Compute-intensive work without the GIL. TODO: multi-threading.
-    let (data, indices, indptr, idf) = py
-        .allow_threads(|| {
-            let builder = tfidf::Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
-            let out = builder.build_csr(&docs); //(data, indices, indptr, idf)
-            out
-        })
-        .map_err(to_pyerr)?;
+    let (data, indices, indptr, idf) = py.detach(|| {
+        let builder = tfidf::Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
+        let out = builder.build_csr(&docs); //(data, indices, indptr, idf)
+        out
+    }).map_err(to_pyerr)?;
 
     // Convert to NumPy without copying where possible. from_vec is zero-copy but from_array is not.
     let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
@@ -612,13 +596,11 @@ fn hashing_tfidf_csr_with_idf(
 
     // Work buffers to be produced by tfidf::build_csr_with_idf
     // Compute-intensive work without the GIL.
-    let (data, indices, indptr) = py
-        .allow_threads(|| {
-            let builder = tfidf::Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
-            let out = builder.build_csr_with_idf(&docs, idf_slice);
-            out
-        })
-        .map_err(to_pyerr)?;
+    let (data, indices, indptr) = py.detach(|| {
+        let builder = tfidf::Builder::new(analyzer, ngram_min, ngram_max, n_features)?;
+        let out = builder.build_csr_with_idf(&docs, idf_slice);
+        out
+    }).map_err(to_pyerr)?;
 
     // Convert to NumPy without copying where possible. from_vec is zero-copy but from_array is not.
     let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();
@@ -655,7 +637,7 @@ fn tfidf_fit_csr(
     let n_rows = docs.len();
 
     let (model, data, indices, indptr) = py
-        .allow_threads(|| {
+        .detach(|| {
             let builder = tfidf::VocabBuilder::new(analyzer, ngram_min, ngram_max)?;
             builder.fit_csr(&docs)
         })
@@ -729,7 +711,7 @@ fn tfidf_transform_csr(
     let n_cols = model.n_cols;
 
     let (data, indices, indptr) = py
-        .allow_threads(|| model.transform_csr(&docs))
+        .detach(|| model.transform_csr(&docs))
         .map_err(to_pyerr)?;
 
     let py_data = PyArray1::<f32>::from_vec(py, data).to_owned();

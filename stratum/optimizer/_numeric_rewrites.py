@@ -1,23 +1,61 @@
 from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
 from stratum.optimizer._op_utils import rewrite_pass, replace_op_in_outputs
-from stratum.optimizer.ir._ops import Op
+from stratum.optimizer.ir._ops import Op, ValueOp
 
 
-def match_two_op_chain(op_cls, type1, type2):
-    """Match predicate for two consecutive ops of the same class with given types."""
-    def match(op):
-        if isinstance(op, op_cls) and op.type is type1 and len(op.outputs) == 1:
-            op2 = op.outputs[0]
-            if isinstance(op2, op_cls) and op2.type is type2:
-                return (op, op2)
+def _is_scalar_const(value) -> bool:
+    """True if ``value`` is a scalar numeric constant safe to compare with ``==``.
+
+    Guards against ndarray constants (e.g. ``df * np.array([...])``), whose
+    ``== const`` yields an array and raises "truth value of an array is
+    ambiguous" when used in a boolean context.
+    """
+    return isinstance(value, (int, float))
+
+
+def _matches_scalar_const(op, const, reversed=None):
+    """Return whether ``op`` has the requested scalar constant operand."""
+    return (
+        op.opt_operand is None
+        and _is_scalar_const(op.constant)
+        and op.constant == const
+        and (reversed is None or op.reversed == reversed)
+    )
+
+
+def match_two_op_chain(op_cls, type1, type2, *, match1=None, match2=None):
+    """Match a typed two-op chain with optional per-operation predicates."""
+    def match(op1):
+        if (
+            isinstance(op1, op_cls)
+            and op1.type is type1
+            and len(op1.outputs) == 1
+            and (match1 is None or match1(op1))
+        ):
+            op2 = op1.outputs[0]
+            if (
+                isinstance(op2, op_cls)
+                and op2.type is type2
+                and (match2 is None or match2(op2))
+            ):
+                return (op1, op2)
         return None
     return match
 
 
-def match_identity_operation(op_cls, type1, const):
+def match_identity_operation(op_cls, type1, const, reversed=None):
+    """Match a var-const NumericOp that performs an identity transformation.
+
+    Parameters
+    ----------
+    reversed : bool or None
+        If None, the ``reversed`` flag is not checked (e.g. multiplication is
+        commutative so ``x*1`` and ``1*x`` are both identities).  Set to
+        ``True`` / ``False`` for non-commutative operations like subtraction.
+    """
     def match(op1):
         if isinstance(op1, op_cls) and op1.type == type1:
-            if op1.opt_operand is None and op1.constant == const:
+            if _matches_scalar_const(op1, const, reversed):
                 return (op1,)
         return None
     return match
@@ -77,6 +115,54 @@ def make_replace_two_op_chain_root_safe(make_replacement):
         return root
     return action
 
+def fold_to_zero(op: Op, root: Op) -> Op:
+    """Constant-fold ``x * 0`` (or ``0 * x``) to ``0``.
+
+    Unlike the identity rewrites, the result is not the input but a constant, so
+    we drop the multiply and its now-dead operand edges and rewire downstream
+    consumers to a :class:`ValueOp` holding ``0.0``. A ValueOp is a source node
+    (no inputs) whose ``process`` returns the constant directly, so the whole
+    ``x`` subgraph is never computed.
+    """
+    zero_op = ValueOp(0.0)
+    for operand in op.inputs:
+        operand.outputs = [out for out in operand.outputs if out is not op]
+    replace_op_in_outputs(op, zero_op)
+    return zero_op if op is root else root
+
+
+def fold_to_one(op: Op, root: Op) -> Op:
+    """Constant-fold ``x ** 0`` to ``1``.
+
+    Parallels :func:`fold_to_zero`: drops the pow op and its dead operand edges
+    and rewires downstream consumers to a :class:`ValueOp` holding ``1``.
+    """
+    one_op = ValueOp(1)
+    for operand in op.inputs:
+        operand.outputs = [out for out in operand.outputs if out is not op]
+    replace_op_in_outputs(op, one_op)
+    return one_op if op is root else root
+
+
+match_exp_minus_one = match_two_op_chain(NumericOp, NumericOpType.EXP, NumericOpType.SUBTRACT,
+    match2=lambda op: _matches_scalar_const(op, 1, reversed=False),
+)
+
+match_add_one_then_log = match_two_op_chain(NumericOp, NumericOpType.ADD, NumericOpType.LOG,
+    match1=lambda op: _matches_scalar_const(op, 1),
+)
+
+_replace_with_abs = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.ABS)
+)
+
+_replace_with_expm1 = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.EXPM1)
+)
+
+_replace_with_log1p = make_replace_two_op_chain_root_safe(
+    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.LOG1P)
+)
 
 eliminate_log_exp = rewrite_pass(
     match_two_op_chain(NumericOp, NumericOpType.LOG, NumericOpType.EXP),
@@ -98,10 +184,6 @@ eliminate_log1p_expm1 = rewrite_pass(
     eliminate_two_op_chain_root_safe,
 )
 
-_replace_with_abs = make_replace_two_op_chain_root_safe(
-    lambda: NumericOp(inputs=[], outputs=[], type=NumericOpType.ABS)
-)
-
 eliminate_sqrt_square = rewrite_pass(
     match_two_op_chain(NumericOp, NumericOpType.SQUARE, NumericOpType.SQRT),
     _replace_with_abs,
@@ -116,3 +198,37 @@ eliminate_abs_abs = rewrite_pass(
     match_two_op_chain(NumericOp, NumericOpType.ABS, NumericOpType.ABS),
     _replace_with_abs,
 )
+
+eliminate_add_zero = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.ADD, 0),
+    eliminate_single_op_chain_root_safe,
+)
+
+fold_exp_minus_one = rewrite_pass(match_exp_minus_one, _replace_with_expm1)
+
+eliminate_identity_subtract = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.SUBTRACT, 0, reversed=False),
+    eliminate_single_op_chain_root_safe,
+)
+
+
+eliminate_any_mul_zero = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.MULTIPLY, 0),
+    fold_to_zero,
+)
+
+eliminate_pow_zero = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.POW, 0, reversed=False),
+    fold_to_one,
+)
+
+# TODO(dtype): unlike the other identity rewrites (`x*1`, `x+0`, `x-0`), dropping
+# `x / 1` is not dtype-preserving. `np.divide` always performs true division, so
+# `int_array / 1` yields float64 while the eliminated result keeps the original
+# integer dtype. The values are equal but the dtype changes.
+eliminate_div_by_one = rewrite_pass(
+    match_identity_operation(NumericOp, NumericOpType.DIVIDE, 1, reversed=False),
+    eliminate_single_op_chain_root_safe,
+)
+
+fold_log_plus_one = rewrite_pass(match_add_one_then_log, _replace_with_log1p)

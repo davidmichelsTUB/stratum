@@ -19,14 +19,30 @@ def _env_int(name, default=0):
     v = os.getenv(name)
     return int(v) if v is not None else int(default)
 
-def _env_str(name, default=None):
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in ("", "none", "null"):
-        return None
-    return s
+
+#: IR levels the optimizer can print a linear plan for, in pipeline order:
+#: ``logical`` (after logical rewrites), ``physical`` (after lowering) and
+#: ``physical_impl`` (after implementation selection -- the executable plan).
+EXPLAIN_LEVELS = ("logical", "physical", "physical_impl")
+
+
+def _normalize_explain(value) -> tuple[str, ...]:
+    """Coerce the ``explain`` config into a tuple of IR levels to print.
+
+    ``None``/``False`` -> off; ``True`` -> the executable plan only
+    (``("physical_impl",)``); a level (or list of levels) -> those levels.
+    """
+    if value is None or value is False:
+        return ()
+    if value is True:
+        return ("physical_impl",)
+    levels = (value,) if isinstance(value, str) else tuple(value)
+    invalid = [lvl for lvl in levels if lvl not in EXPLAIN_LEVELS]
+    if invalid:
+        raise ValueError(
+            f"Invalid explain level(s) {invalid}; valid levels are {list(EXPLAIN_LEVELS)}.")
+    return levels
+
 
 @dataclass
 class _Flags:
@@ -39,12 +55,17 @@ class _Flags:
     stats_top_k: int = 20
     debug_graph: bool = False
     open_graph: bool = False
-    explain_linear_plan: bool = False
+    explain: tuple[str, ...] = ()
     cse: bool = True
     DEBUG: bool = False
     force_polars: bool = _env_bool("STRATUM_FORCE_POLARS", False)
+    pandas_query: bool = _env_bool("STRATUM_PANDAS_QUERY", False)
     fast_dataops_convert: bool = True
     validate_dag: bool = True
+    make_selection_op: bool = True
+    make_map_op: bool = True
+    make_column_projection: bool = True
+    rechunk: bool = True
     buffer_pool_memory_budget: int = 0
 
 FLAGS = _Flags()
@@ -58,20 +79,27 @@ def set_config(rust_backend: bool | None = None,
     scheduler: bool = False,
     debug_graph: bool = False,
     open_graph: bool = False,
-    explain_linear_plan: bool = False,
+    explain: bool | str | list[str] | None = None,
     DEBUG: bool | None = None,
     force_polars: bool = False,
+    pandas_query: bool = False,
     cse: bool = True,
     fast_dataops_convert: bool = True,
     validate_dag: bool = True,
-    buffer_pool_memory_budget: int = 0) -> None:
+    make_selection_op: bool = True,
+    make_map_op: bool = True,
+    make_column_projection: bool = True,
+    rechunk: bool = True,
+buffer_pool_memory_budget: int = 0
+               ) -> None:
     """Runtime toggles (synced env for Rust to read).
 
     Parameter:
     -----------
 
         rust_backend: bool, default false
-            Enable/disable rust backend. It is a feature flag for the Rust backend.
+            Legacy feature flag for Rust execution. The physical
+            operator selector should choose Rust through the registry instead.
 
         num_threads: int >= 0 (0 lets backend decide), default 0
             Set the number of threads for the multithreaded rust operations.
@@ -80,8 +108,8 @@ def set_config(rust_backend: bool | None = None,
             Print the timing in standard output.
 
         allow_patch: bool, default true
-            Allows disabling runtime backend swapping in sensitive contexts. This is a soft
-            kill-switch for disabling all non-sklearn backends, even if their flags are set.
+            Legacy kill-switch for direct adapter Rust execution. It does not
+            control physical operator registration.
 
         scheduler: bool, default false
             Enable/disable stratum's scheduler instead of skrub's make_grid_search.
@@ -95,14 +123,23 @@ def set_config(rust_backend: bool | None = None,
         open_graph: bool, default true
             Open the graph after optimization.
 
-        explain_linear_plan: bool, default false
-            Print a text-based linear execution plan after optimization.
+        explain: bool | str | list[str], default None
+            Print text-based linear execution plans during optimization. ``True``
+            prints the executable plan (equivalent to ``["physical_impl"]``); a
+            list selects which IR levels to print, any of ``"logical"`` (after
+            logical rewrites), ``"physical"`` (after lowering) and
+            ``"physical_impl"`` (after implementation selection).
 
         DEBUG: bool, default false
             Enable/disable debug mode.
 
         force_polars: bool, default false
             Force use of Polars instead of Pandas for dataframe operations.
+
+        pandas_query: bool, default false
+            Evaluate MASK selections on the pandas backend via ``DataFrame.query()``
+            when the predicate is expressible as a query string (no OperandLeaf / str
+            accessor); otherwise fall back to boolean-mask indexing.
     """
     if rust_backend is not None:
         FLAGS.rust_backend = bool(rust_backend)
@@ -117,7 +154,7 @@ def set_config(rust_backend: bool | None = None,
         os.environ["SKRUB_RUST_DEBUG_TIMING"] = "1" if FLAGS.debug_timing else "0"
     if allow_patch is not None:
         FLAGS.allow_patch = bool(allow_patch)
-        os.environ["SKRUB_RUST_ALLOW_MONKEYPATCH"] = "1" if FLAGS.allow_patch else "0"
+        os.environ["SKRUB_RUST_ALLOW_PATCH"] = "1" if FLAGS.allow_patch else "0"
     if stats is not None:
         FLAGS.stats = bool(stats)
     if stats_top_k is not None:
@@ -131,14 +168,20 @@ def set_config(rust_backend: bool | None = None,
     if force_polars is not None:
         FLAGS.force_polars = bool(force_polars)
         os.environ["STRATUM_FORCE_POLARS"] = "1" if FLAGS.force_polars else "0"
+    FLAGS.pandas_query = bool(pandas_query)
+    os.environ["STRATUM_PANDAS_QUERY"] = "1" if FLAGS.pandas_query else "0"
     # TODO: Select between multiple schedulers in the future.
     FLAGS.scheduler = bool(scheduler)
     FLAGS.cse = bool(cse)
     FLAGS.debug_graph = bool(debug_graph)
     FLAGS.open_graph = bool(open_graph)
-    FLAGS.explain_linear_plan = bool(explain_linear_plan)
-
     FLAGS.buffer_pool_memory_budget = int(buffer_pool_memory_budget)
+    FLAGS.explain = _normalize_explain(explain)
+    FLAGS.make_selection_op = bool(make_selection_op)
+    FLAGS.make_map_op = bool(make_map_op)
+    FLAGS.make_column_projection = bool(make_column_projection)
+    FLAGS.rechunk = bool(rechunk)
+
     #FIXME: This should be the default. No need to set it. Remove.
     FLAGS.fast_dataops_convert = bool(fast_dataops_convert)
     FLAGS.validate_dag = bool(validate_dag)
@@ -146,24 +189,7 @@ def set_config(rust_backend: bool | None = None,
 
 def get_config() -> dict:
     # Shallow copy for safety
-    return {
-        "rust_backend": FLAGS.rust_backend,
-        "num_threads": FLAGS.num_threads,
-        "debug_timing": FLAGS.debug_timing,
-        "allow_patch": FLAGS.allow_patch,
-        "scheduler": FLAGS.scheduler,
-        "stats": FLAGS.stats,
-        "stats_top_k": FLAGS.stats_top_k,
-        "debug_graph": FLAGS.debug_graph,
-        "open_graph": FLAGS.open_graph,
-        "explain_linear_plan": FLAGS.explain_linear_plan,
-        "DEBUG" : FLAGS.DEBUG,
-        "force_polars": FLAGS.force_polars,
-        "cse": FLAGS.cse,
-        "fast_dataops_convert": FLAGS.fast_dataops_convert,
-        "validate_dag": FLAGS.validate_dag,
-        "buffer_pool_memory_budget": FLAGS.buffer_pool_memory_budget,
-    }
+    return vars(FLAGS).copy() # asdict if we want a deep copy
 
 @contextmanager
 def config(**kwargs):

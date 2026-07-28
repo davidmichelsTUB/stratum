@@ -5,6 +5,7 @@ from stratum.optimizer._optimize import  optimize
 from stratum.optimizer._optimize import OptConfig
 from stratum.optimizer._algebraic_rewrites import AlgebraicRewritesConfig
 from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
+from stratum.optimizer.ir._ops import OperandRef
 
 class TestCSE(unittest.TestCase):
 
@@ -265,6 +266,22 @@ class TestCSE(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0].process("fit", [out[0].value]), 2)
 
+    def test_eliminate_identity_operation_dedups_repeated_input(self):
+        value = st.as_data_op(2)
+        a = value + (value * 1)
+        b = (value * 1) + value
+        root = a + b
+
+        out, *_ = optimize(root)
+
+        self.assertEqual(len(out), 4)
+        self.assertEqual(out[1].inputs, [out[0]])
+        self.assertEqual(out[2].inputs, [out[0]])
+        self.assertEqual(out[2].opt_operand, OperandRef(0))
+        left_sum = out[1].process("fit", [out[0].value])
+        right_sum = out[2].process("fit", [out[0].value])
+        self.assertEqual(out[3].process("fit", [left_sum, right_sum]), 8)
+
     def test_abs_abs_collapses_to_single_abs(self):
         df = st.as_data_op(-3)
         t1 = df.skb.apply_func(np.abs)
@@ -317,3 +334,326 @@ class TestCSE(unittest.TestCase):
         )
         out, *_ = optimize(t2, config=config)
         self.assertEqual(len(out), 1)
+
+    def test_eliminate_add_zero(self):
+        df = st.as_data_op(2)
+        t1 = df + 0
+        t2 = t1 + 3
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 5)
+
+    def test_eliminate_zero_add(self):
+        df = st.as_data_op(2)
+        t1 = 0 + df
+        t2 = t1 + 3
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 5)
+
+    def test_eliminate_add_zero_root_safe(self):
+        df = st.as_data_op(2)
+        root = df + 0
+        out, *_ = optimize(root)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].process("fit", [out[0].value]), 2)
+
+    def test_disable_eliminate_add_zero(self):
+        df = st.as_data_op(2)
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(add_zero=False),
+        )
+        t1 = 0 + df
+        t2 = t1 + 3
+        out, *_ = optimize(t2, config=config)
+        print(out)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 2)
+
+    def test_no_rewrite_add_nonzero(self):
+        df = st.as_data_op(2)
+        t1 = df + 1
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 3)
+
+    def test_add_zero_with_trailing_op(self):
+        df = st.as_data_op(2)
+        t1 = df + 0
+        t2 = t1 + 3
+        t3 = t2.skb.apply_func(np.log1p)
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 3)
+
+    def test_add_zero_and_identity_operation(self):
+        df = st.as_data_op(2)
+        t1 = df * 1
+        t2 = t1 + 0
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].value, 2)
+
+    def test_exp_minus_one(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1 - 1
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)                                  # source + expm1 (was 3)
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.EXPM1)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 0)     # expm1(0) == 0
+
+    def test_no_rewrite_one_minus_exp(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = 1 - t1                                                     # reversed: NOT expm1
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 3)
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.EXP)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 1)
+
+    def test_no_rewrite_exp_minus_two(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1 - 2                                                     # constant != 1
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 3)
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.EXP)
+
+    def test_disable_exp_minus_one(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1 - 1
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(exp_minus_one=False),
+        )
+        out, *_ = optimize(t2, config=config)
+        self.assertEqual(len(out), 3)
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.EXP)
+
+    def test_exp_minus_one_and_identity_operation(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1 + 0
+        t3 = t2 - 1
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 2)
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.EXPM1)
+
+    def test_log1p_of_exp_minus_one_reduces_to_input(self):
+        df = st.as_data_op(0)
+        t1 = df.skb.apply_func(np.exp)
+        t2 = t1 - 1
+        t3 = t2.skb.apply_func(np.log1p)  # log1p(exp(df)-1)
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 1)  # -> log1p(expm1(df)) -> df
+        self.assertEqual(out[0].value, 0)
+
+    def test_exp_log_minus_one_not_fused(self):
+        df = st.as_data_op(1)
+        t1 = df.skb.apply_func(np.log)
+        t2 = t1.skb.apply_func(np.exp)
+        t3 = t2 - 1  # exp(log(x)) - 1
+        out, *_ = optimize(t3)
+        self.assertEqual(len(out), 2)  # exp/log cancel -> x - 1
+        self.assertIsInstance(out[1], NumericOp)
+        self.assertEqual(out[1].type, NumericOpType.SUBTRACT)
+
+    def test_eliminate_identity_subtract(self):
+        """x - 0  →  x"""
+        df = st.as_data_op(5)
+        t1 = df - 0
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 8)
+
+    def test_eliminate_identity_subtract_root_safe(self):
+        """When x - 0 is the root, the rewrite must not break the DAG."""
+        value = st.as_data_op(7)
+        root = value - 0
+
+        out, *_ = optimize(root)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].process("fit", [out[0].value]), 7)
+
+    def test_disable_eliminate_identity_subtract(self):
+        """Disabling identity_subtract must leave x - 0 untouched."""
+        df = st.as_data_op(5)
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(identity_subtract=False),
+        )
+        t1 = df - 0
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2, config=config)
+        self.assertEqual(len(out), 3)
+        subtract_result = out[1].process("fit", [out[0].value])
+        self.assertEqual(subtract_result, 5)
+        self.assertEqual(out[2].process("fit", [subtract_result]), 8)
+
+    def test_no_rewrite_const_minus_var(self):
+        """0 - x  should NOT be rewritten (it is not an identity)."""
+        df = st.as_data_op(5)
+        t1 = 0 - df
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2)
+        # x - 0 would collapse to 2 ops; 0 - x stays as 3 ops
+        self.assertEqual(len(out), 3)
+
+    def test_eliminate_div_by_one_fires(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 1)                        # only the ValueOp remains
+        self.assertEqual(out[0].value, 6)
+
+    def test_eliminate_div_by_one_in_chain(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)                        # ValueOp + ADD
+        self.assertEqual(out[1].process("fit", [out[0].value]), 9)
+
+    def test_eliminate_div_by_one_disabled(self):
+        df = st.as_data_op(6)
+        t1 = df / 1
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(div_by_one=False),
+        )
+        out, *_ = optimize(t1, config=config)
+        self.assertEqual(len(out), 2)                        # DIV remains
+
+    def test_no_rewrite_one_over_x(self):
+        """1 / x must NOT be rewritten — DIVIDE is non-commutative."""
+        df = st.as_data_op(6)
+        t1 = 1 / df
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + DIV(reversed=True)
+        # sanity: check the DIV is still there and reversed
+        div_op = out[1]
+        self.assertIsInstance(div_op, NumericOp)
+        self.assertEqual(div_op.type, NumericOpType.DIVIDE)
+        self.assertTrue(div_op.reversed)
+
+    def test_no_rewrite_div_by_other_constant(self):
+        """x / 2 must NOT be rewritten — only constant 1 counts."""
+        df = st.as_data_op(6)
+        t1 = df / 2
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)
+
+    def test_no_crash_div_by_ndarray_constant(self):
+        """df / ndarray must neither crash nor rewrite (ambiguous-truth-value trap)."""
+        df = st.as_data_op(np.array([6.0, 8.0]))
+        t1 = df / np.array([1.0, 1.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + DIV survive
+
+    def test_no_crash_mul_by_ndarray_constant(self):
+        """Regression for the pre-existing crash in mul-by-one (#93): before the
+        isinstance guard, `df * np.array([...])` raised 'truth value of an array
+        is ambiguous' inside match_identity_operation."""
+        df = st.as_data_op(np.array([6.0, 8.0]))
+        t1 = df * np.array([2.0, 3.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)                        # ValueOp + MUL survive
+
+    def test_no_crash_exp_minus_ndarray_constant(self):
+        """`exp(x) - ndarray` must not hit the ambiguous-truth-value trap inside
+        match_exp_minus_one (same crash class as the mul/div guards)."""
+        df = st.as_data_op(np.array([1.0, 2.0]))
+        t1 = df.skb.apply_func(np.exp) - np.array([1.0, 1.0])
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 3)                        # ValueOp + EXP + SUBTRACT survive
+
+
+    # --- pow-zero annihilator --------------------------------------------
+
+    def test_pow_zero_annihilates_to_one(self):
+        """x ** 0  →  1"""
+        df = st.as_data_op(5)
+        t1 = df ** 0
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].value, 1)
+
+    def test_pow_zero_with_trailing_op(self):
+        """(x ** 0) + 3  →  1 + 3  →  4"""
+        df = st.as_data_op(5)
+        t1 = df ** 0
+        t2 = t1 + 3
+
+        out, *_ = optimize(t2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[1].process("fit", [out[0].value]), 4)
+
+    def test_pow_zero_root_safe(self):
+        """When x ** 0 is the root, the DAG must not break."""
+        value = st.as_data_op(7)
+        root = value ** 0
+
+        out, *_ = optimize(root)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].value, 1)
+
+    def test_pow_zero_disabled(self):
+        """Disabling pow_zero must leave x ** 0 untouched."""
+        df = st.as_data_op(5)
+        t1 = df ** 0
+
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(pow_zero=False),
+        )
+        out, *_ = optimize(t1, config=config)
+        self.assertEqual(len(out), 2)
+
+    def test_pow_nonzero_untouched(self):
+        """x ** 2 must not be affected by pow_zero."""
+        df = st.as_data_op(5)
+        t1 = df ** 2
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)
+
+    def test_pow_one_untouched(self):
+        """x ** 1 must not be affected (identity, not annihilator)."""
+        df = st.as_data_op(5)
+        t1 = df ** 1
+
+        out, *_ = optimize(t1)
+        self.assertEqual(len(out), 2)
+
+    def test_disable_pow_zero_does_not_affect_log_exp(self):
+        """Disabling pow_zero must not suppress other rewrites."""
+        df = st.as_data_op(1)
+        t1 = df.skb.apply_func(np.log)
+        t2 = t1.skb.apply_func(np.exp)
+
+        config = OptConfig(
+            algebraic_rewrites=True,
+            algebraic_rewrite_config=AlgebraicRewritesConfig(pow_zero=False),
+        )
+        out, *_ = optimize(t2, config=config)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].value, 1)

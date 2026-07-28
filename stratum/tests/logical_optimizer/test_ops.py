@@ -11,12 +11,19 @@ from sklearn.preprocessing import StandardScaler
 from skrub._data_ops._data_ops import DataOp
 
 from stratum.optimizer.ir._ops import (
-    OperandRef, OperandBinder, OutputType, BinOp, CallOp, DummyConfigManager, GetAttrOp,
-    GetItemOp, ImplOp, MethodCallOp, Op, SearchEvalOp, ValueOp,
+    OperandRef, OperandBinder, OutputType, BinOp, CallOp, ChoiceOp, DummyConfigManager,
+    GetAttrOp, GetItemOp, ImplOp, MethodCallOp, Op, SearchEvalOp, ValueOp,
     VariableOp, check_estm_inputs, estimator_parallel_config,
     estm_supports_polars, process_estimator_task, process_transformer_task,
+    remap_operand_refs,
 )
+from stratum.optimizer.ir._numeric_ops import NumericOp, NumericOpType
+from stratum.optimizer.ir._selection_ops import SelectionOp, SelectionKind
+from stratum.optimizer.ir._column_expr import BinOpExpr, Col, OperandLeaf
 from stratum.optimizer._optimize import optimize as optimize_
+from stratum.optimizer.ir._projection_ops import ApplyUDFOp
+from stratum.optimizer.physical._impl_selection import bind_op
+from stratum.optimizer.physical._plan_context import PlanContext
 
 
 class TestOpCloning(unittest.TestCase):
@@ -46,17 +53,20 @@ class TestOpCloning(unittest.TestCase):
         with st.config(fast_dataops_convert=True):
             ops, *_ = optimize_(choice.empty)
 
-        with self.assertRaises(ValueError):
+        # ops[0] is the physical source op; physical ops are never cloned.
+        with self.assertRaises(TypeError):
             ops[0].clone()
 
-        cloned = ops[1].clone()
-        self.assertIsNot(cloned, ops[1])
-        self.assertEqual(ops[1].args, cloned.args)
-        self.assertEqual(ops[1].columns, cloned.columns)
+        # Cloning is a logical-phase operation (choice unrolling): logical ops
+        # clone with their config preserved. In the optimized plan above these
+        # have been swapped to physical impls, which refuse cloning (as asserted
+        # for ops[0]).
+        udf = ApplyUDFOp(args=(1,), kwargs={}, columns=["a"])
+        self.assertEqual((1,), udf.clone().args)
+        self.assertEqual(["a"], udf.clone().columns)
 
-        cloned = ops[2].clone()
-        self.assertIsNot(cloned, ops[2])
-        self.assertEqual(ops[2].key, cloned.key)
+        getitem = GetItemOp(key="a")
+        self.assertEqual("a", getitem.clone().key)
 
         cloned = ops[3].clone()
         self.assertIsNot(ops[3].estimator, cloned.estimator)
@@ -232,6 +242,7 @@ class TestOpProcess(unittest.TestCase):
     def test_getitem_with_placeholder(self):
         # input 0 is the container, input 1 is the graph-fed key.
         op = GetItemOp(key=OperandRef(1))
+        bind_op(op, PlanContext.from_flags())  # GetItemOp executes via its physical impl
         result = op.process("fit_transform", [{"x": 42}, "x"])
         self.assertEqual(result, 42)
 
@@ -325,3 +336,92 @@ class TestEdgeDedup(unittest.TestCase):
         op.add_output(out)
         op.add_output(out)
         self.assertEqual(op.outputs, [out])
+
+    def test_replace_input_dedups_existing_input_before_old_input(self):
+        value, old = ValueOp(1), ValueOp(2)
+        op = NumericOp(
+            type=NumericOpType.ADD,
+            inputs=[value, old],
+            opt_operand=OperandRef(1),
+        )
+
+        op.replace_input(old, value)
+
+        self.assertEqual(op.inputs, [value])
+        self.assertEqual(op.opt_operand, OperandRef(0))
+
+    def test_replace_input_dedups_existing_input_after_old_input(self):
+        old, value = ValueOp(1), ValueOp(2)
+        op = NumericOp(
+            type=NumericOpType.ADD,
+            inputs=[old, value],
+            opt_operand=OperandRef(0),
+        )
+
+        op.replace_input(old, value)
+
+        self.assertEqual(op.inputs, [value])
+        self.assertEqual(op.opt_operand, OperandRef(0))
+
+    def test_replace_input_dedups_refs_in_nested_container(self):
+        # OperandRefs nested in a list/tuple field (not just a scalar) are renumbered.
+        obj, x = ValueOp(1), ValueOp(2)
+        op = MethodCallOp("m", args=[OperandRef(1)], kwargs={"k": OperandRef(0)})
+        op.inputs = [obj, x]
+
+        op.replace_input(x, obj)  # obj already at slot 0 -> collapse slot 1 into 0
+
+        self.assertEqual(op.inputs, [obj])
+        self.assertEqual(op.args, [OperandRef(0)])
+        self.assertEqual(op.kwargs, {"k": OperandRef(0)})
+
+    def test_replace_input_remaps_column_expr_predicate(self):
+        # A ref buried in a ColumnExpr predicate (SelectionOp) must be renumbered
+        # too, not just refs in plain tuple/list/dict fields.
+        src, leaf = ValueOp(1), ValueOp(2)
+        predicate = BinOpExpr(operator.gt, Col("x"), OperandLeaf(OperandRef(1)))
+        sel = SelectionOp(kind=SelectionKind.MASK, predicate=predicate,
+                          inputs=[src, leaf])
+
+        sel.replace_input(leaf, src)  # src already at slot 0 -> collapse slot 1
+
+        self.assertEqual(sel.inputs, [src])
+        self.assertEqual(list(sel.predicate.iter_operand_refs()), [OperandRef(0)])
+
+    def test_replace_input_shifts_column_expr_predicate(self):
+        # Removing a middle slot shifts higher refs (inside the predicate) left by one.
+        src, leaf_a, leaf_b = ValueOp(1), ValueOp(2), ValueOp(3)
+        predicate = BinOpExpr(operator.gt,
+                              OperandLeaf(OperandRef(1)),   # leaf_a -> merged into src
+                              OperandLeaf(OperandRef(2)))   # leaf_b -> shifts to slot 1
+        sel = SelectionOp(kind=SelectionKind.MASK, predicate=predicate,
+                          inputs=[src, leaf_a, leaf_b])
+
+        sel.replace_input(leaf_a, src)
+
+        self.assertEqual(sel.inputs, [src, leaf_b])
+        self.assertEqual(list(sel.predicate.iter_operand_refs()),
+                         [OperandRef(0), OperandRef(1)])
+
+    def test_replace_input_keeps_duplicate_slots_for_choice(self):
+        # ChoiceOp consumes inputs by position; a would-be duplicate is kept as a
+        # plain swap rather than collapsed, so the outcome count is preserved.
+        a, b = ValueOp(1), ValueOp(2)
+        choice = ChoiceOp(outcome_names=["o1", "o2"], choice_name="c", inputs=[a, b])
+        self.assertTrue(choice.consumes_inputs_positionally())
+
+        choice.replace_input(b, a)
+
+        self.assertEqual(choice.inputs, [a, a])
+
+    def test_replace_input_keeps_duplicate_slots_for_impl_op(self):
+        # ImplOp resolves inputs via its cached operand_index, so its slots must not
+        # be collapsed either (mirrors CSE's positional-consumer guard).
+        impl = ImplOp(name="impl", skrub_impl=SimpleNamespace(_fields=()))
+        a, b = ValueOp(1), ValueOp(2)
+        impl.inputs = [a, b]
+        self.assertTrue(impl.consumes_inputs_positionally())
+
+        impl.replace_input(b, a)
+
+        self.assertEqual(impl.inputs, [a, a])
