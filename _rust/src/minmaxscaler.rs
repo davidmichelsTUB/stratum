@@ -97,13 +97,29 @@ pub fn compute_minmax_scale_fit(
                 let mut min = vec![f32::INFINITY; n_cols];
                 let mut max = vec![f32::NEG_INFINITY; n_cols];
                 for row in chunk.rows() {
-                    for col_idx in 0..n_cols {
-                        let value = row[col_idx];
-                        if min[col_idx] > value {
-                            min[col_idx] = value
+                    match row.as_slice() {
+                        Some(row_slice) => {
+                            for ((m, mx), &value) in
+                                min.iter_mut().zip(max.iter_mut()).zip(row_slice.iter())
+                            {
+                                if *m > value {
+                                    *m = value;
+                                }
+                                if *mx < value {
+                                    *mx = value;
+                                }
+                            }
                         }
-                        if max[col_idx] < value {
-                            max[col_idx] = value
+                        None => {
+                            for col_idx in 0..n_cols {
+                                let value = row[col_idx];
+                                if min[col_idx] > value {
+                                    min[col_idx] = value
+                                }
+                                if max[col_idx] < value {
+                                    max[col_idx] = value
+                                }
+                            }
                         }
                     }
                 }

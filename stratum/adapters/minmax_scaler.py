@@ -39,11 +39,9 @@ class RustyMinMaxScaler(_SKMinMaxScaler):
             self.n_jobs = n_jobs
 
     def _n_chunks(self, X):
-        print(f"N_rows = {X.shape[0]}")
-
         blocks = max(1, X.shape[0] // MIN_BLOCK_LEN)
-        print(f"Number of blocks: {blocks}")
-        return min(blocks, self.n_jobs)
+        blocks =min(blocks, self.n_jobs)
+        return blocks
 
     def fit(self, X, y=None):
         rc = get_config()
@@ -79,12 +77,12 @@ class RustyMinMaxScaler(_SKMinMaxScaler):
             return super().transform(X)
 
         check_is_fitted(self)
-
+        t0 = rb.start_timing()
         # Coerce to float32 array for Rust
         X_arr = np.asarray(X, dtype=np.float32)
         data_min = self.data_min_.astype(np.float32)
         data_max = self.data_max_.astype(np.float32)
-        t0 = rb.start_timing()
+        
         try:
             out = rb.minmax_scale_transform(
                 X_arr, data_min, data_max, self._n_chunks(X_arr), self.clip
